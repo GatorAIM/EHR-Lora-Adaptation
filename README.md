@@ -43,11 +43,3 @@ The code expects PCORnet-style site tables (DX, PX, LAB, MED admin,
 vitals, cohort labels). Raw data paths are not committed; modules take
 them as parameters.
 
-## Citation
-
-> Paper reference will be added upon publication.
-
-## License
-
-An OSI-approved license (e.g., MIT or Apache-2.0) will be added before
-the first tagged release.
