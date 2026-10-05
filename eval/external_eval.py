@@ -1,10 +1,12 @@
 """
-Cross-site (external) evaluation.
+Checkpoint scoring on an external-site test loader.
 
-A model that was finetuned on a *source* site (or on the combined "ALL"
-cohort) is scored on a *target* site's test split without any further
-training on the target side. This is the regime that surfaces negative
-transfer and calibration drift.
+In the paper's cross-hospital adaptation experiment, each strategy is
+first fitted on the target institution's development cohort using the
+same validation-AUPRC protocol as the internal experiment. This module
+performs the final scoring step after that target-site adaptation. It
+can also score an unadapted source checkpoint as a separate exploratory
+analysis, but that is not the reported primary cross-hospital design.
 
 Non-LoRA checkpoints (freeze-all / tune-last-N / full finetune) only
 need the architecture and state_dict; LoRA checkpoints additionally
@@ -78,7 +80,7 @@ def load_source_checkpoint(model, source_ckpt: str) -> None:
     model.load_state_dict(state, strict=True)
 
 
-def external_evaluate(
+def score_checkpoint_on_external_loader(
     *,
     config,
     block_cls,
@@ -92,7 +94,7 @@ def external_evaluate(
     extras: Optional[Dict] = None,
 ) -> Dict[str, float]:
     """
-    End-to-end cross-site evaluation for one (source, target) pair.
+    Score one already fitted checkpoint on an external test loader.
 
     Steps:
       1. Read the adapter config from the source sidecar.
@@ -119,3 +121,7 @@ def external_evaluate(
         extras=payload_extras,
     )
     return metrics
+
+
+# Backward-compatible name retained for earlier callers.
+external_evaluate = score_checkpoint_on_external_loader

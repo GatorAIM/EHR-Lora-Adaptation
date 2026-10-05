@@ -17,6 +17,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import wilcoxon
 
 
 _SEED_RE = re.compile(r"_seed(\d+)")
@@ -50,15 +51,33 @@ def extract_record(sidecar_path: Path, *, method: str) -> dict:
     and falls back to the parent directory name.
     """
     payload = load_sidecar(sidecar_path)
-    metrics = payload.get("metrics") or payload.get("final_test_metric_after_reload") or {}
+    metrics = (
+        payload.get("metrics")
+        or payload.get("final_test_metric_after_reload")
+        or payload.get("test_metrics")
+        or {}
+    )
+    validation = (
+        payload.get("final_val_metric_after_reload")
+        or payload.get("best_val_metric")
+        or {}
+    )
+    seed = payload.get("seed")
+    if seed is None:
+        seed = parse_seed_from_name(sidecar_path.name)
+    adapter = payload.get("adapter") or payload.get("lora") or {}
+    config = payload.get("config_name") or json.dumps(adapter, sort_keys=True)
     return {
         "method": method,
         "task": payload.get("task") or sidecar_path.parent.name,
-        "seed": payload.get("seed") or parse_seed_from_name(sidecar_path.name),
+        "site": payload.get("site", ""),
+        "seed": seed,
+        "config": config,
         "sidecar_path": str(sidecar_path),
         "checkpoint_path": payload.get("checkpoint_path") or payload.get("best_model_path"),
-        "adapter": payload.get("adapter") or payload.get("lora") or {},
+        "adapter": adapter,
         **{k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
+        **{f"val_{k}": float(v) for k, v in validation.items() if isinstance(v, (int, float))},
     }
 
 
@@ -110,22 +129,117 @@ def summarise(records: List[dict], *, metrics: Sequence[str]) -> pd.DataFrame:
 def select_best_lora_per_task(
     lora_records: List[dict],
     *,
-    selection_metric: str = "val_acc",
+    selection_metric: str = "val_pr_auc",
+    selection_site: Optional[str] = None,
 ) -> List[dict]:
     """
-    Reduce a multi-scheme LoRA sweep to one row per (task, seed) by
-    picking the scheme with the highest `selection_metric`. This gives
-    the per-task "LoRA (best)" column used throughout the paper.
+    Select one LoRA configuration per task using the mean validation metric.
+
+    When `selection_site` is supplied, configurations are selected only from
+    that site's validation records and then applied to records from every site.
+    This supports selecting configurations internally before fixing them for
+    external-site adaptation. Without `selection_site`, selection is performed
+    independently within each site. Test metrics never enter selection.
     """
-    best: Dict[Tuple[str, int], dict] = {}
+    grouped: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
     for rec in lora_records:
-        seed = rec.get("seed")
-        if seed is None or selection_metric not in rec:
+        if rec.get("seed") is None or selection_metric not in rec:
             continue
-        key = (rec["task"], int(seed))
-        if key not in best or rec[selection_metric] > best[key][selection_metric]:
-            best[key] = rec
-    return list(best.values())
+        if selection_site is not None and str(rec.get("site", "")) != str(selection_site):
+            continue
+        grouped[(str(rec.get("site", "")), rec["task"], rec["config"])].append(
+            float(rec[selection_metric])
+        )
+    selected: Dict[Tuple[str, str], str] = {}
+    for (site, task, config), values in grouped.items():
+        key = (site, task)
+        candidate = (float(np.mean(values)), config)
+        current = selected.get(key)
+        if current is None:
+            selected[key] = config
+            continue
+        current_score = float(np.mean(grouped[(site, task, current)]))
+        if candidate[0] > current_score or (candidate[0] == current_score and config < current):
+            selected[key] = config
+    if selection_site is not None:
+        fixed = {
+            task: config
+            for (site, task), config in selected.items()
+            if site == str(selection_site)
+        }
+        return [rec for rec in lora_records if fixed.get(rec["task"]) == rec.get("config")]
+    return [rec for rec in lora_records
+            if selected.get((str(rec.get("site", "")), rec["task"])) == rec.get("config")]
+
+
+def _holm_adjust(p_values: Sequence[float]) -> List[float]:
+    """Apply Holm's step-down correction to a sequence of P values."""
+    values = np.asarray(p_values, dtype=float)
+    order = np.argsort(values)
+    adjusted = np.empty_like(values)
+    running = 0.0
+    total = len(values)
+    for rank, index in enumerate(order):
+        running = max(running, (total - rank) * float(values[index]))
+        adjusted[index] = min(1.0, running)
+    return adjusted.tolist()
+
+
+def paired_wilcoxon_holm(
+    records: List[dict],
+    *,
+    metrics: Sequence[str],
+    reference_method: str,
+    run_key: str = "seed",
+) -> pd.DataFrame:
+    """Compare each method with a reference using matched repeated runs.
+
+    Holm correction is applied separately within each metric across all
+    task-method comparisons, matching the manuscript's statistical analysis.
+    """
+    indexed: Dict[Tuple[str, object], Dict[str, dict]] = defaultdict(dict)
+    for record in records:
+        if record.get(run_key) is None:
+            continue
+        indexed[(record["task"], record[run_key])][record["method"]] = record
+
+    comparisons = []
+    methods = sorted({record["method"] for record in records} - {reference_method})
+    tasks = sorted({record["task"] for record in records})
+    for metric in metrics:
+        for task in tasks:
+            for method in methods:
+                differences = []
+                for (record_task, _), method_records in indexed.items():
+                    if record_task != task:
+                        continue
+                    reference = method_records.get(reference_method)
+                    candidate = method_records.get(method)
+                    if reference is None or candidate is None:
+                        continue
+                    if metric not in reference or metric not in candidate:
+                        continue
+                    differences.append(float(candidate[metric]) - float(reference[metric]))
+                if not differences:
+                    continue
+                array = np.asarray(differences, dtype=float)
+                raw_p = 1.0 if np.allclose(array, 0) else float(wilcoxon(array).pvalue)
+                comparisons.append({
+                    "task": task,
+                    "method": method,
+                    "reference_method": reference_method,
+                    "metric": metric,
+                    "mean_difference": float(array.mean()),
+                    "n_matched_runs": int(array.size),
+                    "p_value": raw_p,
+                })
+
+    for metric in metrics:
+        indices = [i for i, row in enumerate(comparisons) if row["metric"] == metric]
+        adjusted = _holm_adjust([comparisons[i]["p_value"] for i in indices])
+        for index, value in zip(indices, adjusted):
+            comparisons[index]["p_value_holm"] = value
+    return pd.DataFrame(comparisons)
 
 
 # ---------------------------------------------------------------------------

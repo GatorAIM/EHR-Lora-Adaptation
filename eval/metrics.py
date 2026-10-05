@@ -14,13 +14,16 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 from sklearn.metrics import (
+    auc,
     accuracy_score,
-    average_precision_score,
     f1_score,
+    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
+from scipy.optimize import minimize
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +78,156 @@ def discrimination_metrics(
 ) -> Dict[str, float]:
     """Compute Accuracy / Precision / Recall / F1 at `threshold`, plus AUROC / AUPRC."""
     pred = (y_prob >= threshold).astype(int)
+    precision_curve, recall_curve, _ = precision_recall_curve(y_true, y_prob)
     return {
         "acc": float(accuracy_score(y_true, pred)),
         "precision": float(precision_score(y_true, pred, zero_division=0)),
         "recall": float(recall_score(y_true, pred, zero_division=0)),
         "f1": float(f1_score(y_true, pred, zero_division=0)),
         "roc_auc": float(roc_auc_score(y_true, y_prob)),
-        "pr_auc": float(average_precision_score(y_true, y_prob)),
+        "pr_auc": float(auc(recall_curve, precision_curve)),
     }
+
+
+def select_validation_thresholds(
+    y_true: np.ndarray, y_prob: np.ndarray
+) -> Dict[str, float]:
+    """Select operating thresholds from validation predictions only."""
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+    precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
+    if thresholds.size == 0:
+        raise ValueError("validation predictions do not define a threshold")
+    f1 = 2 * precision[:-1] * recall[:-1] / np.maximum(
+        precision[:-1] + recall[:-1], 1e-12
+    )
+    fpr, tpr, roc_thresholds = roc_curve(y_true, y_prob)
+    eligible = np.flatnonzero(tpr >= 0.80)
+    sensitivity_index = (
+        eligible[np.argmin(fpr[eligible])] if eligible.size else int(np.argmax(tpr))
+    )
+    return {
+        "max_validation_f1": float(thresholds[int(np.nanargmax(f1))]),
+        "max_validation_youden": float(roc_thresholds[int(np.nanargmax(tpr - fpr))]),
+        "validation_sensitivity_0.80": float(roc_thresholds[int(sensitivity_index)]),
+    }
+
+
+def threshold_metrics(
+    y_true: np.ndarray, y_prob: np.ndarray, *, threshold: float
+) -> Dict[str, float]:
+    """Evaluate a prespecified or validation-selected threshold."""
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+    prediction = y_prob >= float(threshold)
+    positive = y_true == 1
+    negative = ~positive
+    tp = int(np.sum(prediction & positive))
+    fp = int(np.sum(prediction & negative))
+    tn = int(np.sum(~prediction & negative))
+    fn = int(np.sum(~prediction & positive))
+    return {
+        "threshold": float(threshold), "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "sensitivity": tp / max(1, tp + fn),
+        "specificity": tn / max(1, tn + fp),
+        "ppv": tp / max(1, tp + fp),
+        "npv": tn / max(1, tn + fn),
+        "accuracy": (tp + tn) / max(1, len(y_true)),
+        "f1": 2 * tp / max(1, 2 * tp + fp + fn),
+    }
+
+
+def fit_logistic_recalibration(
+    y_true: np.ndarray, y_prob: np.ndarray
+) -> Dict[str, float | bool]:
+    """Estimate logistic recalibration parameters from validation predictions."""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_prob = np.clip(np.asarray(y_prob, dtype=np.float64), 1e-6, 1 - 1e-6)
+    if y_true.size == 0 or np.unique(y_true).size != 2:
+        raise ValueError("calibration requires nonempty binary outcomes with both classes")
+    logit = np.log(y_prob / (1 - y_prob))
+
+    def objective(beta):
+        linear = beta[0] + beta[1] * logit
+        fitted = 1 / (1 + np.exp(-np.clip(linear, -40, 40)))
+        loss = float(np.sum(np.logaddexp(0, linear) - y_true * linear))
+        gradient = np.array([
+            np.sum(fitted - y_true),
+            np.sum((fitted - y_true) * logit),
+        ])
+        return loss, gradient
+
+    fit = minimize(objective, np.array([0.0, 1.0]), jac=True, method="BFGS")
+    return {
+        "intercept": float(fit.x[0]),
+        "slope": float(fit.x[1]),
+        "fit_success": bool(fit.success),
+    }
+
+
+def apply_logistic_recalibration(
+    y_prob: np.ndarray, *, intercept: float, slope: float
+) -> np.ndarray:
+    """Apply validation-estimated logistic recalibration to new predictions."""
+    probability = np.clip(np.asarray(y_prob, dtype=np.float64), 1e-6, 1 - 1e-6)
+    logit = np.log(probability / (1 - probability))
+    linear = float(intercept) + float(slope) * logit
+    return 1 / (1 + np.exp(-np.clip(linear, -40, 40)))
+
+
+def calibration_intercept_slope(
+    y_true: np.ndarray, y_prob: np.ndarray
+) -> Dict[str, float | bool]:
+    """Return calibration intercept and slope for a set of predictions."""
+    fitted = fit_logistic_recalibration(y_true, y_prob)
+    return {
+        "calibration_intercept": float(fitted["intercept"]),
+        "calibration_slope": float(fitted["slope"]),
+        "calibration_fit_success": bool(fitted["fit_success"]),
+    }
+
+
+def brier_skill_score(
+    y_true: np.ndarray, y_prob: np.ndarray, *, reference_probability: float
+) -> float:
+    """Brier skill relative to a fixed validation-derived prevalence reference."""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    reference = np.repeat(float(reference_probability), len(y_true))
+    reference_brier = brier_binary(y_true, reference)
+    if reference_brier <= 0:
+        return float("nan")
+    return 1 - brier_binary(y_true, y_prob) / reference_brier
+
+
+def decision_curve(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    thresholds: Optional[np.ndarray] = None,
+) -> list[dict[str, float]]:
+    """Compute model, treat-all, and treat-none net benefit across thresholds."""
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+    thresholds = np.asarray(
+        thresholds if thresholds is not None else np.linspace(0.01, 0.80, 80),
+        dtype=np.float64,
+    )
+    if y_true.size == 0 or np.any((thresholds <= 0) | (thresholds >= 1)):
+        raise ValueError("decision-curve thresholds must be within (0, 1)")
+    prevalence = float(np.mean(y_true))
+    rows = []
+    for threshold in thresholds:
+        prediction = y_prob >= threshold
+        tp = int(np.sum(prediction & (y_true == 1)))
+        fp = int(np.sum(prediction & (y_true == 0)))
+        odds = float(threshold / (1 - threshold))
+        rows.append({
+            "threshold": float(threshold),
+            "model_net_benefit": float(tp / len(y_true) - fp / len(y_true) * odds),
+            "treat_all_net_benefit": float(prevalence - (1 - prevalence) * odds),
+            "treat_none_net_benefit": 0.0,
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------------

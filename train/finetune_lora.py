@@ -10,8 +10,8 @@ Pipeline:
      trainable.
   4. Train with BCE-with-logits, optionally with a positive-class
      weight for imbalanced tasks.
-  5. Select the best checkpoint by validation accuracy and reload it
-     for the final test-set scoring.
+  5. Select the best checkpoint by validation AUPRC and reload it
+     before a single final test-set scoring pass.
 """
 
 from __future__ import annotations
@@ -108,17 +108,17 @@ def finetune_lora(
     ece_bins: int,
 ):
     """
-    Train loop with best-by-val-acc selection and early stopping.
+    Train loop with best-by-validation-AUPRC selection and early stopping.
 
     Returns a dict with:
       best_state              - state_dict of the best snapshot
       best_epoch              - epoch index where the snapshot was taken
       best_val_metric         - validation metric block at selection
-      best_test_metric        - test metric block at selection
+      final_val_metric        - validation metrics after best-state reload
       final_test_metric       - test metric block after reloading best
     """
     optimizer = make_optimizer(model, lr=lr, weight_decay=weight_decay)
-    best = {"acc": -1.0, "state": None, "epoch": None, "val": None, "test": None}
+    best = {"pr_auc": float("-inf"), "state": None, "epoch": None, "val": None}
     bad_epochs = 0
 
     for epoch in range(1, int(epochs) + 1):
@@ -126,14 +126,12 @@ def finetune_lora(
         if int(eval_every) > 0 and epoch % int(eval_every) != 0:
             continue
         val_metric = evaluate_all(model, val_loader, device, ece_bins=ece_bins)
-        test_metric = evaluate_all(model, test_loader, device, ece_bins=ece_bins)
-        if val_metric["acc"] > best["acc"] + float(min_delta):
+        if val_metric["pr_auc"] > best["pr_auc"] + float(min_delta):
             best.update(
-                acc=val_metric["acc"],
+                pr_auc=val_metric["pr_auc"],
                 state={k: v.detach().cpu() for k, v in model.state_dict().items()},
                 epoch=int(epoch),
                 val=dict(val_metric),
-                test=dict(test_metric),
             )
             bad_epochs = 0
         else:
@@ -143,11 +141,13 @@ def finetune_lora(
 
     if best["state"] is not None:
         model.load_state_dict(best["state"], strict=True)
+    final_val = evaluate_all(model, val_loader, device, ece_bins=ece_bins)
     final_test = evaluate_all(model, test_loader, device, ece_bins=ece_bins)
     return {
         "best_state": best["state"],
         "best_epoch": best["epoch"],
         "best_val_metric": best["val"],
-        "best_test_metric_at_selection": best["test"],
+        "selection_metric": "validation_pr_auc",
+        "final_val_metric_after_reload": final_val,
         "final_test_metric_after_reload": final_test,
     }
