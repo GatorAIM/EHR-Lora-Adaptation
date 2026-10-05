@@ -60,20 +60,18 @@ data/       sequence assembly, temporal splitting, and landmark truncation
 train/      masked-event pretraining and downstream adaptation strategies
 eval/       discrimination, calibration, and checkpoint evaluation
 analysis/   repeated-run aggregation and configuration comparison
-tests/      reference tests for the documented analysis contracts
 ```
 
 ## Environment
 
 The reference modules require Python 3.10 or later, PyTorch, pandas, NumPy,
-scikit-learn, and SciPy. Create the provided environment and run the contract
-tests from the repository root:
+scikit-learn, and SciPy. Create the provided environment from the repository
+root:
 
 ```bash
 conda env create -f environment.yml
 conda activate ehr-lora
 export PYTHONPATH="$PWD:${PYTHONPATH}"
-python -m unittest -v tests/test_reference_contracts.py
 ```
 
 ## Reproduction Workflow
@@ -135,5 +133,5 @@ Freeze-all within each matched run.
 Raw and encounter-level EHR data cannot be redistributed. The code operates on
 locally authorized extracts satisfying the input contract above. The public
 repository provides the environment specification, model and adaptation
-components, preprocessing and evaluation contracts, and reference tests needed
-to reproduce the analysis with authorized data.
+components, and preprocessing and evaluation procedures needed to reproduce the
+analysis with authorized data.
